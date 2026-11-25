@@ -15,7 +15,9 @@ carries the fills and each symbol's latest close, and the bot answers
 that batch with its orders for the next bar. Orders decided on bar k
 fill at bar k+1's open, so a sell's proceeds never fund a buy of the
 same reply: buys are sized against the cash on hand before this
-reply's sells. Everything here is integer math in a fixed symbol
+reply's sells. A batch with no bar for a symbol carries that symbol's
+last recorded close forward, so the 6-bar drop lookback stays aligned
+with the bar clock. Everything here is integer math in a fixed symbol
 order, no clock, no environment, no randomness, so the two grading
 runs produce byte-identical action logs.
 """
@@ -61,8 +63,15 @@ def on_hello(state):
 
 def on_batch(state, batch):
     # Record this batch of bars first: every symbol's latest close.
+    # A symbol with no bar in this batch carries its last recorded
+    # close forward, so its history stays one entry per bar and the
+    # 6-bar drop lookback stays aligned with the bar clock; skipping
+    # the append would silently shorten that symbol's history and
+    # compare closes 7+ bars apart.
     for symbol in SYMBOLS:
         close = state.close(symbol)
+        if close is None and closes[symbol]:
+            close = closes[symbol][-1]
         if close is not None:
             closes[symbol].append(close)
     # Drop entries whose buy never filled: a fill lands in the next
@@ -95,7 +104,10 @@ def on_batch(state, batch):
             chg = (value - holding.cost) * 10000 // holding.cost if holding.cost > 0 else None
             held_bars = 0
         else:
-            close = state.close(symbol)
+            # Current close as the bot sees it: the last recorded
+            # close, carried forward above if this batch had no bar
+            # for the symbol, so exits still evaluate on a missing bar.
+            close = closes[symbol][-1] if closes[symbol] else None
             chg = _chg_bps(close, ref[0]) if close is not None else None
             held_bars = state.seq - ref[1]
         if chg is not None and (
@@ -128,9 +140,16 @@ def on_batch(state, batch):
                 "max_slippage_bps": MAX_SLIPPAGE_BPS,
             }
         )
-        entries[symbol] = (state.close(symbol), state.seq)
+        entries[symbol] = (closes[symbol][-1], state.seq)
         cash_left -= spend
-    return orders
+    # Defensive cap: the harness rejects the whole reply if it carries
+    # more than max_orders_per_bar orders, so never emit more than
+    # that. Exits are appended first, so a trim here would only ever
+    # drop entries. With 7 symbols the most this bot can emit is 14,
+    # so the cap never binds on this competition — it only guards
+    # against a future symbol list growing past it.
+    cap = state.hello["caps"].get("max_orders_per_bar", 16)
+    return orders[:cap]
 
 
 makefun_bars.run(on_batch, on_hello=on_hello)
