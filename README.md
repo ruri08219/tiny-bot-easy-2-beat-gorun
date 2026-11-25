@@ -14,7 +14,7 @@ Hourly meme-coin bars are jumpy: the biggest moves land in a few single bars, an
 - **Exit:** position PnL (against its cost, fees included) reaches +300 bps, or falls to -200 bps, or 24 bars pass.
 - **Size:** 24% of equity per new position (the cap is 25%). Buys are sized against cash on hand before this reply's sells, because a sell's proceeds never fund a buy of the same reply.
 
-Validated in a local replay simulator on the dev window (136 bars), three 72-bar slices and two reversed windows: it beats buy-and-hold on all six, worst margin +$30, mean margin +$314, worst max drawdown 5.3% (limit 25%), 12–44 trades per window (minimum 8).
+Validated in a local replay simulator on the dev window (136 bars), three 72-bar slices and two reversed windows: it beats buy-and-hold on all six, worst margin +$30, mean margin +$330, worst max drawdown 5.6% (limit 25%), 12–60 trades per window (minimum 8). Grade-local on the dev window: net PnL -$69 (buy-and-hold -$869, so +$801 ahead of it), 60 trades, max drawdown 5.6%, guardrails met.
 
 ## Run it
 
