@@ -4,8 +4,11 @@ Strategy (mean reversion on hourly Solana bars, validated on the dev
 window, three 72-bar slices and two reversed windows in a local replay
 simulator): buy an asset after it drops >= 190 bps over the last 6
 hourly bars, hold at most 24 bars, take profit at +300 bps, stop loss
-at -200 bps. Position PnL is measured against the position cost, so
-fees are already in. Each buy is 24% of equity (the weight cap is 25%).
+at -200 bps. The exits are measured against the close that triggered
+the buy (the decision close), exactly as the simulator that validated
+this strategy measures them; the fill price, slippage and fees are
+already inside the net PnL the grader reports. Each buy is 24% of
+equity (the weight cap is 25%).
 
 hello: the harness greets the bot once; every batch of bars after that
 carries the fills and each symbol's latest close, and the bot answers
@@ -26,15 +29,15 @@ import makefun_bars
 SYMBOLS = ("FARTCOIN", "JITOSOL", "POPCAT", "RAY", "SOL", "WETH", "WIF")
 DROP_BPS = 190          # buy when the 6-hour drop is at least this deep
 DROP_HOURS = 6          # lookback for the drop, in hourly bars
-TAKE_BPS = 300          # take profit at +3% over the position cost
-STOP_BPS = 200          # stop loss at -2% under the position cost
+TAKE_BPS = 300          # take profit at +3% over the decision close
+STOP_BPS = 200          # stop loss at -2% under the decision close
 HOLD_MAX_BARS = 24      # give up after 24 bars even without a trigger
 SIZE_BPS = 2400         # 24% of equity per new position (cap is 25%)
 MAX_SLIPPAGE_BPS = 300  # reject a fill that moved this far from the close
 MIN_NOTIONAL = 1000000  # 1 USDC, in quote units (the harness minimum)
 
 closes = {s: [] for s in SYMBOLS}
-opened_seq = {}  # symbol -> seq of the batch where its position appeared
+entries = {}  # symbol -> (decision close, decision seq) recorded when a buy is ordered
 
 
 def _drop_bps(hist):
@@ -46,13 +49,9 @@ def _drop_bps(hist):
     return (new - old) * 10000 // old
 
 
-def _pnl_bps(state, symbol):
-    """The open position's PnL in bps against its cost (fees included)."""
-    holding = state.positions.get(symbol)
-    if holding is None or holding.cost <= 0:
-        return None
-    value = state.value(symbol, holding.qty)
-    return (value - holding.cost) * 10000 // holding.cost
+def _chg_bps(now, ref):
+    """(now - ref) in bps, integer math."""
+    return (now - ref) * 10000 // ref
 
 
 def on_hello(state):
@@ -66,13 +65,12 @@ def on_batch(state, batch):
         close = state.close(symbol)
         if close is not None:
             closes[symbol].append(close)
-    # Track when each open position first appeared (its fill bar).
-    for symbol in list(opened_seq):
-        if symbol not in state.positions:
-            del opened_seq[symbol]
-    for symbol in state.positions:
-        if symbol not in opened_seq:
-            opened_seq[symbol] = state.seq
+    # Drop entries whose buy never filled: a fill lands in the next
+    # batch's account, so a symbol with no position one bar after its
+    # decision had its order rejected.
+    for symbol in list(entries):
+        if symbol not in state.positions and state.seq > entries[symbol][1] + 1:
+            del entries[symbol]
 
     if state.warming_up:
         # Warm-up bars build history only; orders on them are rejected.
@@ -81,14 +79,27 @@ def on_batch(state, batch):
     orders = []
     cash_left = state.cash  # sells in this reply do not fund its buys
     # 1) Exits first: take profit, stop loss, or the max hold reached.
+    # The change is measured from the decision close, not the fill cost:
+    # measuring from the cost moves both triggers by the fill's slippage
+    # and fees (stops fire ~1% early, take-profits ~1% late) and the
+    # extra churn eats the edge the simulator validated.
     for symbol in SYMBOLS:
         holding = state.positions.get(symbol)
         if holding is None:
             continue
-        pnl = _pnl_bps(state, symbol)
-        held_bars = state.seq - opened_seq.get(symbol, state.seq)
-        if pnl is not None and (
-            pnl >= TAKE_BPS or pnl <= -STOP_BPS or held_bars >= HOLD_MAX_BARS
+        ref = entries.get(symbol)
+        if ref is None:
+            # A position with no recorded decision (should not happen):
+            # fall back to its cost so the stops still protect it.
+            value = state.value(symbol, holding.qty)
+            chg = (value - holding.cost) * 10000 // holding.cost if holding.cost > 0 else None
+            held_bars = 0
+        else:
+            close = state.close(symbol)
+            chg = _chg_bps(close, ref[0]) if close is not None else None
+            held_bars = state.seq - ref[1]
+        if chg is not None and (
+            chg >= TAKE_BPS or chg <= -STOP_BPS or held_bars >= HOLD_MAX_BARS
         ):
             orders.append(
                 {
@@ -117,6 +128,7 @@ def on_batch(state, batch):
                 "max_slippage_bps": MAX_SLIPPAGE_BPS,
             }
         )
+        entries[symbol] = (state.close(symbol), state.seq)
         cash_left -= spend
     return orders
 
